@@ -1,331 +1,287 @@
 #!/usr/bin/env python3
 """
-Prepare a phenotype/covariate file for UK Biobank OQFE WES GWAS
-- Loads cohort & fields from UKB RAP (dxdata/spark) or local CSVs
-- Applies accelerometer QC and basic transformations
-- Builds a normalized activity phenotype (`mpa_norm_inv`)
-- Harmonizes IDs with the WES PLINK .fam
-- Exports a .phe (TSV) ready for PLINK/REGENIE
-- (Optional) uploads to RAP via dxpy
+ukb_wes_exwas_vig_vs_sed.py
+===========================
 
-Designed to run in UKB RAP (Databricks/Spark), but also works locally
-with pandas (limited mode).
+UK Biobank OQFE WES **Exome-Wide Association Study (ExWAS)** helper that models
+**vigorous activity vs sedentary activity**.
+
+What it does
+------------
+1) Builds a PLINK/REGENIE-ready `.phe`:
+   - Reads participant CSV/Parquet with EID + activity + covariates
+   - Optionally derives season/quarter from a date column
+   - Transforms TWO activity columns independently:
+       * outcome (phenotype): e.g., vigorous_activity
+       * adjuster (covariate): e.g., sedentary_activity
+     Each can be normalized to [0,1] and optionally inverted.
+   - Harmonizes with WES `.fam`
+   - Writes `.phe` with both transformed columns
+
+2) Runs ExWAS (optional):
+   - PLINK 2 (`--glm`)
+   - REGENIE step 1 (array) + step 2 (exome), quantitative by default
+
+Usage examples
+--------------
+# Vigorous as outcome, adjust for sedentary (both normalized; vigorous inverted)
+python ukb_wes_exwas_vig_vs_sed.py \
+  --source accel_covariates.csv \
+  --fam ukb23158_c1_b0_v1.fam \
+  --eid-col eid \
+  --phenotype-col vigorous_activity --phenotype-invert \
+  --adjust-col sedentary_activity \
+  --covars-base 31,21022,22009_1,22009_2,22009_3,22009_4,22009_5 \
+  --phe-out pa_wes_vig_vs_sed.phe \
+  --run-plink2 \
+  --wes-prefix /data/ukb23158_c{CHR}_b0_v1 \
+  --threads 8
+
+# Sedentary as outcome, adjust for vigorous (no inversion)
+python ukb_wes_exwas_vig_vs_sed.py \
+  --source accel_covariates.csv \
+  --fam ukb23158_c1_b0_v1.fam \
+  --eid-col eid \
+  --phenotype-col sedentary_activity \
+  --adjust-col vigorous_activity \
+  --covars-base 31,21022,22009_1,22009_2,22009_3,22009_4,22009_5 \
+  --phe-out pa_wes_sed_vs_vig.phe \
+  --run-regenie \
+  --array-prefix /data/ukb_array_merged \
+  --wes-prefix /data/ukb23158_c{CHR}_b0_v1 \
+  --threads 8
 """
 
 import os
-import sys
 import argparse
-import datetime as dt
-
-# Optional imports: work on RAP if available, otherwise fall back to pandas
-try:
-    import pyspark
-    from pyspark.sql import SparkSession
-    from pyspark.sql import functions as F
-    from pyspark.sql.types import IntegerType, FloatType, StringType, DateType
-    HAS_SPARK = True
-except Exception:
-    HAS_SPARK = False
-
-try:
-    import databricks.koalas as ks  # legacy RAP notebooks
-    HAS_KOALAS = True
-except Exception:
-    HAS_KOALAS = False
-
-try:
-    import dxpy  # RAP upload
-    HAS_DXPY = True
-except Exception:
-    HAS_DXPY = False
-
+import subprocess
 import pandas as pd
 import numpy as np
 
+# ---------- helpers ----------
 
-# ----------------------------
-# Constants / defaults
-# ----------------------------
-DEFAULT_EXOME_FIELD_ID = "23158"  # OQFE WES PLINK release
-# Minimal field list used in the notebook description; extend as needed
-DEFAULT_FIELDS = [
-    # core IDs
-    "eid",
-    # sex, age
-    "31",      # Sex
-    "21022",   # Age at recruitment
-    # accelerometer metadata / QC examples
-    "90003",   # Wear start date
-    "90127",   # QC: good wear time?
-    "90139",   # QC: calibration?
-    # genetic PCs (example subset; add more as needed)
-    "22009_1", "22009_2", "22009_3", "22009_4", "22009_5",
-    "22009_6", "22009_7", "22009_8", "22009_9", "22009_10",
-    # phenotype column (placeholder: mpa)
-    # If your notebook derives MPA from another table, swap in that source here
-    "mpa"
-]
+def read_fam(fam_path: str) -> pd.DataFrame:
+    fam_cols = ["FID","IID","PID","MID","SEX","PHENOTYPE"]
+    return pd.read_csv(fam_path, sep=r"\s+", header=None, names=fam_cols)
 
-# ----------------------------
-# Helpers
-# ----------------------------
-
-def start_spark(app_name: str = "prepare_wes_pheno"):
-    if not HAS_SPARK:
-        return None
-    spark = (
-        SparkSession
-        .builder
-        .appName(app_name)
-        .getOrCreate()
-    )
-    return spark
-
-
-def parse_args():
-    p = argparse.ArgumentParser(
-        description="Prepare phenotype/covariates for UKB OQFE WES GWAS"
-    )
-    p.add_argument("--cohort-sql", type=str, default=None,
-                   help="SQL/where-clause to filter EIDs (RAP-style). If not provided, use all rows.")
-    p.add_argument("--fields", type=str, default=",".join(DEFAULT_FIELDS),
-                   help="Comma-separated UKB fields to retrieve (e.g., 'eid,31,21022,90003,90127,90139,mpa').")
-    p.add_argument("--exome-field-id", type=str, default=DEFAULT_EXOME_FIELD_ID,
-                   help="UKB field id for OQFE WES PLINK (default 23158).")
-    p.add_argument("--fam-path", type=str, required=True,
-                   help="Path to a WES .fam file (e.g., ukb23158_c1_b0_v1.fam).")
-    p.add_argument("--source", type=str, default=None,
-                   help="Path to a parquet/csv of the phenotype/covariates if not pulling via RAP. "
-                        "If a directory, will try parquet; if a csv, will load csv.")
-    p.add_argument("--eid-col", type=str, default="eid",
-                   help="Column name for participant ID.")
-    p.add_argument("--output", type=str, default="pa_wes.phe",
-                   help="Output .phe TSV path.")
-    p.add_argument("--upload-path", type=str, default=None,
-                   help="Optional RAP upload path (e.g., '/Acc_Ave/pa_wes.phe'). Requires dxpy.")
-    p.add_argument("--season-from", type=str, default="90003",
-                   help="Field/column used to compute season/quarter (wear start date).")
-    p.add_argument("--mpa-col", type=str, default="mpa",
-                   help="Column name for moderate physical activity (or your chosen phenotype).")
-    p.add_argument("--fail-missing-mpa", action="store_true",
-                   help="If set, raise an error if phenotype column is missing.")
-    return p.parse_args()
-
-
-def read_table(args, spark):
-    """
-    Load the phenotype/covariates table.
-    - If running on RAP and you have a proper dxdata pull, replace this with that logic.
-    - Here we support:
-      * Spark read (parquet/csv)
-      * Pandas read (csv)
-    """
-    fields = [f.strip() for f in args.fields.split(",") if f.strip()]
-    eid_col = args.eid_col
-
-    if args.source is None:
-        raise ValueError(
-            "--source must point to a parquet/csv export of your fields (or replace this function with dxdata retrieval)."
-        )
-
-    source = args.source
-    if spark and HAS_SPARK:
-        if os.path.isdir(source):
-            df = spark.read.parquet(source)
-        elif source.lower().endswith(".parquet"):
-            df = spark.read.parquet(source)
-        elif source.lower().endswith(".csv"):
-            df = spark.read.csv(source, header=True, inferSchema=True)
-        else:
-            raise ValueError("Unsupported --source format for Spark. Use directory parquet, .parquet, or .csv")
-
-        if args.cohort_sql:
-            df.createOrReplaceTempView("cohort_tbl")
-            df = spark.sql(f"SELECT * FROM cohort_tbl WHERE {args.cohort_sql}")
-
-        # keep requested fields that exist
-        cols_present = [c for c in fields if c in df.columns]
-        if eid_col not in cols_present:
-            cols_present = [eid_col] + cols_present
-        df = df.select(*[c for c in cols_present if c in df.columns])
-        return df
-
-    # Pandas fallback
-    if source.lower().endswith(".csv"):
-        df = pd.read_csv(source)
-    elif source.lower().endswith(".parquet"):
-        df = pd.read_parquet(source)
-    else:
-        raise ValueError("Pandas fallback supports only .csv or .parquet for --source")
-
-    if args.cohort_sql:
-        # Very simple, unsafe eval-based filter for local mode; prefer Spark in RAP.
-        df = df.query(args.cohort_sql)
-
-    # Keep requested fields if they exist
-    cols_present = [c for c in fields if c in df.columns]
-    if args.eid_col not in cols_present:
-        cols_present = [args.eid_col] + cols_present
-    df = df[cols_present]
+def derive_quarter(df: pd.DataFrame, date_col: str|None) -> pd.DataFrame:
+    if date_col and date_col in df.columns:
+        df["_date_tmp"] = pd.to_datetime(df[date_col], errors="coerce")
+        df["wear_quarter"] = df["_date_tmp"].dt.quarter
+        df.drop(columns=["_date_tmp"], inplace=True)
     return df
 
+def normalize_series(s: pd.Series) -> pd.Series:
+    s = pd.to_numeric(s, errors="coerce")
+    mn, mx = s.min(skipna=True), s.max(skipna=True)
+    if pd.isna(mn) or pd.isna(mx) or mx == mn:
+        return pd.Series(np.nan, index=s.index)
+    return (s - mn) / (mx - mn)
 
-def qc_and_transform(df, args, spark):
+def transform_trait(df: pd.DataFrame, col: str, do_norm: bool, do_inv: bool, label: str) -> tuple[pd.DataFrame,str]:
     """
-    - Flip accelerometer QC flags (90127, 90139) to 1=pass when recorded as booleans/0/1 with inverse logic.
-    - Parse wear start date to season/quarter.
-    - Build normalized/inverted phenotype mpa_norm_inv.
-    Returns same backend type (Spark or Pandas).
+    Create a transformed column from df[col].
+    Returns df and the new column name.
+    - If do_norm: new name ends with _norm or _norm_inv
+    - If not do_norm and do_inv requested -> error (ambiguous)
     """
-    eid = args.eid_col
-    season_from = args.season_from
-    mpa_col = args.mpa_col
-
-    flag_cols = [c for c in ["90127", "90139"] if c in (df.columns if HAS_SPARK and spark else df.columns)]
-
-    if HAS_SPARK and spark:
-        # Ensure numeric flags, flip 0/1 if needed; here we map non-null to int and keep as-is
-        for c in flag_cols:
-            df = df.withColumn(c, F.col(c).cast(IntegerType()))
-
-        # Parse date for season
-        if season_from in df.columns:
-            # Many UKB date fields are like 'YYYY-MM-DD' or numeric date codes; attempt to cast.
-            df = df.withColumn("_wear_date", F.to_date(F.col(season_from).cast(StringType())))
-            # Quarter: 1..4
-            df = df.withColumn("wear_quarter", F.quarter(F.col("_wear_date")))
-            df = df.drop("_wear_date")
-
-        # Phenotype normalization & inversion
-        if mpa_col not in df.columns:
-            if args.fail_missing_mpa:
-                raise ValueError(f"Phenotype column '{mpa_col}' not found.")
-            # Create null phenotype if absent
-            df = df.withColumn(mpa_col, F.lit(None).cast(FloatType()))
-
-        df = df.withColumn(mpa_col, F.col(mpa_col).cast(FloatType()))
-        w = Window = pyspark.sql.window.Window
-        # Get min/max ignoring nulls
-        stats = df.agg(F.min(mpa_col).alias("minv"), F.max(mpa_col).alias("maxv")).collect()[0]
-        minv, maxv = stats["minv"], stats["maxv"]
-        if minv is not None and maxv is not None and maxv != minv:
-            df = df.withColumn(
-                "mpa_norm_inv",
-                (F.lit(maxv) - F.col(mpa_col)) / (F.lit(maxv) - F.lit(minv))
-            )
+    if col not in df.columns:
+        raise ValueError(f"Column '{col}' not found.")
+    if not do_norm and do_inv:
+        raise ValueError(f"--{label}-invert requires --{label}-normalize.")
+    if do_norm:
+        norm = normalize_series(df[col])
+        if do_inv:
+            out_col = f"{col}_norm_inv"
+            df[out_col] = 1.0 - norm
         else:
-            df = df.withColumn("mpa_norm_inv", F.lit(None).cast(FloatType()))
-        return df
-
-    # Pandas flow
-    for c in flag_cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    if season_from in df.columns:
-        # Try parse to datetime
-        df["_wear_date"] = pd.to_datetime(df[season_from], errors="coerce")
-        df["wear_quarter"] = df["_wear_date"].dt.quarter
-        df.drop(columns=["_wear_date"], inplace=True)
-
-    if mpa_col not in df.columns:
-        if args.fail_missing_mpa:
-            raise ValueError(f"Phenotype column '{mpa_col}' not found.")
-        df[mpa_col] = np.nan
-
-    df[mpa_col] = pd.to_numeric(df[mpa_col], errors="coerce")
-    minv, maxv = df[mpa_col].min(skipna=True), df[mpa_col].max(skipna=True)
-    if pd.notnull(minv) and pd.notnull(maxv) and maxv != minv:
-        df["mpa_norm_inv"] = (maxv - df[mpa_col]) / (maxv - minv)
+            out_col = f"{col}_norm"
+            df[out_col] = norm
     else:
-        df["mpa_norm_inv"] = np.nan
+        out_col = col
+        df[out_col] = pd.to_numeric(df[col], errors="coerce")
+    return df, out_col
 
-    return df
-
-
-def read_fam(fam_path: str):
-    """
-    Read PLINK .fam (6 columns). Return pandas DataFrame with columns:
-    FID, IID, PID, MID, SEX, PHENOTYPE
-    """
-    fam_cols = ["FID", "IID", "PID", "MID", "SEX", "PHENOTYPE"]
-    fam = pd.read_csv(fam_path, sep=r"\s+", header=None, names=fam_cols)
-    return fam
-
-
-def harmonize_with_fam(df, fam, eid_col):
-    """
-    Create FID/IID from EID and intersect with fam.
-    Output: pandas DataFrame with FID, IID, and all covariates/phenotypes.
-    """
-    if HAS_SPARK and isinstance(df, pyspark.sql.dataframe.DataFrame):
-        # Move to pandas for merge with fam
-        pdf = df.toPandas()
-    else:
-        pdf = df.copy()
-
-    # Ensure eid is numeric/integer-like (UKB IDs often are)
-    pdf[eid_col] = pd.to_numeric(pdf[eid_col], errors="coerce").astype("Int64")
+def harmonize_with_fam(df: pd.DataFrame, fam: pd.DataFrame, eid_col: str) -> pd.DataFrame:
+    df[eid_col] = pd.to_numeric(df[eid_col], errors="coerce").astype("Int64")
     fam["IID"] = pd.to_numeric(fam["IID"], errors="coerce").astype("Int64")
-
-    # Build FID/IID as UKB ID (both = eid)
-    pdf["FID"] = pdf[eid_col]
-    pdf["IID"] = pdf[eid_col]
-
-    merged = fam[["FID", "IID"]].merge(
-        pdf.drop(columns=[c for c in ["FID", "IID"] if c in pdf.columns]),
-        on="IID",
-        how="inner"
+    df["FID"] = df[eid_col]
+    df["IID"] = df[eid_col]
+    merged = fam[["FID","IID"]].merge(
+        df.drop(columns=[c for c in ["FID","IID"] if c in df.columns]),
+        on="IID", how="inner"
     )
-    # After merge, set FID to IID to keep standard UKB convention (or retain fam FID)
     merged["FID"] = merged["IID"]
     return merged
 
-
-def write_phe(df, out_path):
-    """
-    Write a .phe: tab-separated, NA for missing.
-    Ensure first columns include FID, IID.
-    """
+def write_phe(df: pd.DataFrame, out_path: str) -> None:
     cols = df.columns.tolist()
-    # Bring FID, IID to front if present
-    front = [c for c in ["FID", "IID"] if c in cols]
+    front = [c for c in ["FID","IID"] if c in cols]
     rest = [c for c in cols if c not in front]
-    ordered = front + rest
-    df[ordered].to_csv(out_path, sep="\t", index=False, na_rep="NA")
+    df[front+rest].to_csv(out_path, sep="\t", index=False, na_rep="NA")
 
+# ---------- runners ----------
 
-def dx_upload(local_path, upload_path):
-    if not HAS_DXPY:
-        raise RuntimeError("dxpy not available; cannot upload.")
-    # Create directories on RAP path if needed; dxpy will make intermediate folders when --path is used in CLI
-    # Here we call API directly
-    # Simple approach: shell out to dx if present; otherwise use API calls.
-    try:
-        import subprocess
-        subprocess.check_call(["dx", "upload", local_path, "--path", upload_path, "--wait"])
-    except Exception as e:
-        raise RuntimeError(f"dx upload failed: {e}")
+def run_plink2(wes_prefix: str, phe: str, pheno_name: str, covars: list[str], outdir: str, threads: int = 4, chr_list=range(1,23), mac_min: int = 5):
+    os.makedirs(outdir, exist_ok=True)
+    phe_df = pd.read_csv(phe, sep="\t")
+    keep = os.path.join(outdir, "samples.keep")
+    phe_df[["FID","IID"]].to_csv(keep, sep=" ", index=False, header=False)
+    covar_str = ",".join(covars)
+    for chrn in chr_list:
+        bfile = wes_prefix.replace("{CHR}", str(chrn))
+        outbase = os.path.join(outdir, f"chr{chrn}_{pheno_name}")
+        cmd = [
+            "plink2",
+            "--bfile", bfile,
+            "--keep", keep,
+            "--pheno", phe, "--pheno-name", pheno_name,
+            "--covar", phe, "--covar-name", covar_str,
+            "--glm", "hide-covar", "cols=+a1freq,+a1count,+obs,+mac,+ax",
+            "--mac", str(mac_min),
+            "--threads", str(threads),
+            "--out", outbase
+        ]
+        print("[PLINK2]", " ".join(cmd))
+        subprocess.check_call(cmd)
 
+def run_regenie(array_prefix: str, wes_prefix: str, phe: str, pheno_name: str, covars: list[str],
+                outdir1: str, outdir2: str, threads: int = 8, bt: int = 0, chr_list=range(1,23), mac_min: int = 5):
+    os.makedirs(outdir1, exist_ok=True)
+    os.makedirs(outdir2, exist_ok=True)
+    phe_df = pd.read_csv(phe, sep="\t")
+    keep = os.path.join(outdir1, "samples.keep")
+    phe_df[["FID","IID"]].to_csv(keep, sep=" ", index=False, header=False)
+    covar_str = ",".join(covars)
+    # Step 1
+    cmd1 = [
+        "regenie","--step","1",
+        "--bed",array_prefix,
+        "--keep",keep,
+        "--phenoFile",phe,"--phenoCol",pheno_name,
+        "--covarFile",phe,"--covarColList",covar_str,
+        "--bt",str(bt),
+        "--bsize","1000","--lowmem",
+        "--lowmem-prefix",os.path.join(outdir1,"tmp_chunks"),
+        "--threads",str(threads),
+        "--out",os.path.join(outdir1,"step1")
+    ]
+    print("[REGENIE step1]", " ".join(cmd1))
+    subprocess.check_call(cmd1)
+    pred_list = os.path.join(outdir1,"step1_pred.list")
+    if not os.path.exists(pred_list):
+        preds = [os.path.join(outdir1,f) for f in sorted(os.listdir(outdir1)) if f.endswith(".pred")]
+        with open(pred_list,"w") as fh:
+            for p in preds: fh.write(p+"\n")
+    # Step 2 per chromosome
+    for chrn in chr_list:
+        bed_prefix = wes_prefix.replace("{CHR}", str(chrn))
+        outbase = os.path.join(outdir2, f"chr{chrn}")
+        cmd2 = [
+            "regenie","--step","2",
+            "--bed",bed_prefix,
+            "--keep",keep,
+            "--phenoFile",phe,"--phenoCol",pheno_name,
+            "--covarFile",phe,"--covarColList",covar_str,
+            "--bt",str(bt),
+            "--pred",pred_list,
+            "--minMAC",str(mac_min),
+            "--threads",str(threads),
+            "--out",outbase
+        ]
+        print("[REGENIE step2]", " ".join(cmd2))
+        subprocess.check_call(cmd2)
+
+# ---------- CLI ----------
 
 def main():
-    args = parse_args()
+    ap = argparse.ArgumentParser(description="ExWAS: model vigorous vs sedentary (choose outcome and adjuster).")
+    # Prep
+    ap.add_argument("--source", required=True, help="CSV or Parquet with EID + activity columns + covariates")
+    ap.add_argument("--fam", required=True, help="WES .fam path")
+    ap.add_argument("--eid-col", default="eid", help="Participant ID column")
+    ap.add_argument("--date-col", default=None, help="Optional date column for wear quarter")
+    # outcome
+    ap.add_argument("--phenotype-col", required=True, help="Outcome column (e.g., vigorous_activity OR sedentary_activity)")
+    ap.add_argument("--phenotype-normalize", action="store_true", default=True, help="Normalize outcome [0,1] (default on)")
+    ap.add_argument("--phenotype-no-normalize", dest="phenotype-normalize", action="store_false", help="Disable normalization for outcome")
+    ap.add_argument("--phenotype-invert", action="store_true", help="Invert outcome after normalization")
+    # adjuster
+    ap.add_argument("--adjust-col", required=True, help="Adjust covariate column (the other activity)")
+    ap.add_argument("--adjust-normalize", action="store_true", default=True, help="Normalize adjuster [0,1] (default on)")
+    ap.add_argument("--adjust-no-normalize", dest="adjust-normalize", action="store_false", help="Disable normalization for adjuster")
+    ap.add_argument("--adjust-invert", action="store_true", help="Invert adjuster after normalization")
+    # base covars
+    ap.add_argument("--covars-base", default="", help="Comma-separated base covariates (e.g., 31,21022,22009_1,...). These will be combined with the transformed adjust column.")
+    ap.add_argument("--phe-out", default="pa_wes_vig_vs_sed.phe", help="Output .phe path")
+    # Runners
+    ap.add_argument("--run-plink2", action="store_true", help="Run PLINK2 ExWAS")
+    ap.add_argument("--run-regenie", action="store_true", help="Run REGENIE ExWAS")
+    ap.add_argument("--wes-prefix", help="WES PLINK prefix with {CHR} placeholder")
+    ap.add_argument("--threads", type=int, default=8)
+    # REGENIE specifics
+    ap.add_argument("--array-prefix", help="Array PLINK prefix for step 1 (REGENIE)")
+    ap.add_argument("--bt", type=int, default=0, help="Binary trait? 1=yes, 0=quantitative (default)")
 
-    spark = start_spark() if HAS_SPARK else None
-    df = read_table(args, spark)
-    df = qc_and_transform(df, args, spark)
-    fam = read_fam(args.fam_path)
-    merged = harmonize_with_fam(df, fam, args.eid_col)
-    write_phe(merged, args.output)
+    args = ap.parse_args()
 
-    print(f"[OK] Wrote {args.output} with {merged.shape[0]} samples and {merged.shape[1]} columns.")
+    # Load table
+    if args.source.lower().endswith(".csv"):
+        df = pd.read_csv(args.source)
+    elif args.source.lower().endswith(".parquet"):
+        df = pd.read_parquet(args.source)
+    else:
+        raise ValueError("--source must be .csv or .parquet")
 
-    if args.upload_path:
-        try:
-            dx_upload(args.output, args.upload_path)
-            print(f"[OK] Uploaded to RAP path: {args.upload_path}")
-        except Exception as e:
-            print(f"[WARN] Upload skipped/failed: {e}")
+    df = derive_quarter(df, args.date_col)
 
+    # Transform outcome and adjuster
+    df, pheno_col_out = transform_trait(
+        df, args.phenotype_col, getattr(args, "phenotype-normalize"), args.phenotype_invert, label="phenotype"
+    )
+    df, adjust_col_out = transform_trait(
+        df, args.adjust_col, getattr(args, "adjust-normalize"), args.adjust_invert, label="adjust"
+    )
+
+    # Harmonize & write .phe
+    fam = read_fam(args.fam)
+    phe_df = harmonize_with_fam(df, fam, eid_col=args.eid_col)
+    write_phe(phe_df, args.phe_out)
+    print(f"[OK] wrote {args.phe_out}")
+    print(f"    Outcome used in GWAS:   {pheno_col_out}")
+    print(f"    Adjuster included as covariate: {adjust_col_out}")
+
+    # Build covariate list = base covars + transformed adjust column
+    base_covars = [c for c in args.covars_base.split(",") if c.strip()]
+    covars_full = base_covars + [adjust_col_out]
+
+    if args.run_plink2:
+        if not args.wes_prefix:
+            raise ValueError("--run-plink2 requires --wes-prefix")
+        run_plink2(
+            wes_prefix=args.wes_prefix,
+            phe=args.phe_out,
+            pheno_name=pheno_col_out,
+            covars=covars_full,
+            outdir="results/plink2",
+            threads=args.threads
+        )
+
+    if args.run_regenie:
+        missing = [k for k in ["wes_prefix","array_prefix"] if getattr(args, k) in (None, "")]
+        if missing:
+            raise ValueError("--run-regenie requires --array-prefix and --wes-prefix")
+        run_regenie(
+            array_prefix=args.array_prefix,
+            wes_prefix=args.wes_prefix,
+            phe=args.phe_out,
+            pheno_name=pheno_col_out,
+            covars=covars_full,
+            outdir1="results/regenie_step1",
+            outdir2="results/regenie_step2_wes",
+            threads=args.threads,
+            bt=args.bt
+        )
 
 if __name__ == "__main__":
     main()
